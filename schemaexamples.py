@@ -13,7 +13,6 @@ import urllib
 import glob
 import re
 import threading
-import datetime, time
 
 class schemaExamples():
     
@@ -37,7 +36,7 @@ class schemaExamples():
                 with schemaExamples.exlock:
                     if not schemaExamples.EXAMPLES.get(keyvalue,None):
                         schemaExamples.EXAMPLES[keyvalue] = example
-                        
+
                     for term in example.terms:
                 
                         if(not schemaExamples.EXAMPLESMAP.get(term, None)):
@@ -59,31 +58,28 @@ class schemaExamples():
         return examples
 
     @staticmethod
-    def allExamples():
-        return schemaExamples.EXAMPLES.values()
+    def allExamples(sort=False):
+        ret = schemaExamples.EXAMPLES.values()
+        if sort:
+            return sorted(ret, key=lambda x: (x.exmeta['file'],x.exmeta['filepos']))
+        return ret
             
-    
+            
     @staticmethod
-    def serializeExample(ex):
-        buff = []
-        buff.append("TYPES: %s %s" % (ex.keyvalue,ex.terms))
-        buff.append("PRE-MARKUP: \n%s" % ex.getHtml)
-        buff.append("MICRODATA: \n%s" % ex.getMicrodata)
-        
-        return buff.join("\n")
-            
+    def count():
+        return len(schemaExamples.EXAMPLES)
+    
     
     
 class Example ():
     
     ExamplesCount = 0
-    
-        
 
     def __init__ (self, terms, original_html, microdata, rdfa, jsonld, exmeta):
         """Example constructor, registers itself with the ExampleMap of terms to examples."""
-        global EXAMPLES, EXAMPLESMAP, ExamplesCount
         self.terms = terms
+        if not len(terms):
+            log.info("No terms for ex: %s in file %s" % (exmeta["filepos"],emeta["file"]) )
         self.original_html = original_html
         self.microdata = microdata
         self.rdfa = rdfa
@@ -93,6 +89,7 @@ class Example ():
         if not self.keyvalue:
             self.keyvalue = "%s-gen-%s"% (terms[0],Example.ExamplesCount)
             self.exmeta['id'] = self.keyvalue
+        Example.ExamplesCount += 1
 
     def get(self, name) :
         """Exposes original_content, microdata, rdfa and jsonld versions (in the layer(s) specified)."""
@@ -105,6 +102,10 @@ class Example ():
         if name == 'jsonld':
            return self.jsonld
           
+    def key(self):
+        return self.keyvalue
+    def terms(self):
+        return self.terms
     def getHtml(self):
         return self.original_html
     def getMicrodata(self):
@@ -113,26 +114,35 @@ class Example ():
         return self.rdfa
     def getJsonld(self):
         return self.jsonld
-    
+
+    def hasHtml(self):
+        return len(self.original_html.strip()) > 0
+    def hasMicrodata(self):
+        return len(self.microdata.strip()) > 0
+    def hasRdfa(self):
+        return len(self.rdfa.strip()) > 0
+    def hasJsonld(self):
+        return len(self.jsonld.strip()) > 0
+
     def serialize(self):
         buff = []
         termnames = ""
         first = True
-        id = self.keyvalue
-        if "-gen-" in id:
-            id = ""
+        idd = "#%s" % self.keyvalue
+        if "-gen-" in idd:
+            idd = ""
         for t in self.terms:
             if first:
                 first = False
             else:
-                termnames += ", "
+                termnames += ","
             termnames += t
             
-        buff.append("TYPES: #%s %s" % (id,termnames))
-        buff.append("PRE-MARKUP: \n%s" % self.getHtml())
-        buff.append("MICRODATA: \n%s" % self.getMicrodata())
-        buff.append("RDFA: \n%s" % self.getRdfa())
-        buff.append("JSON: \n%s" % self.getJsonld())
+        buff.append("TYPES: %s %s\n" % (idd,termnames))
+        buff.append("PRE-MARKUP:\n%s" % self.getHtml())
+        buff.append("MICRODATA:\n%s" % self.getMicrodata())
+        buff.append("RDFA:\n%s" % self.getRdfa())
+        buff.append("JSON:\n%s" % self.getJsonld())
         
         return "\n".join(buff)
 
@@ -144,6 +154,7 @@ class ExampleFileParser():
         self.file = ""
         self.filepos = 0
         self.initFields()
+        self.idcache = []
 
     def initFields(self):
         self.currentStr = []
@@ -156,6 +167,8 @@ class ExampleFileParser():
         self.state= ""
 
     def nextPart(self, next):
+        self.trimCurrentStr() 
+        
         if (self.state == 'PRE-MARKUP:'):
             self.preMarkupStr = "".join(self.currentStr)
         elif (self.state ==  'MICRODATA:'):
@@ -166,59 +179,89 @@ class ExampleFileParser():
             self.jsonStr = "".join(self.currentStr)
         self.state = next
         self.currentStr = []
+        
+    def trimCurrentStr(self):
+        #strip: leading blank lines, strip multi blank lines (replace with 1) end with blank line
+        temp = []
+        begin = True
+        inwhitespace = False
+        
+        for line in self.currentStr:
+            linelen = len(line.strip())
+            if not linelen:
+                if begin:
+                    continue
+                else:
+                    inwhitespace = True
+            else:
+                if begin:
+                    temp.append("\n")
+                    begin = False
+                if inwhitespace:
+                    temp.append("\n")
+                    inwhitespace = False
+                temp.append(line+"\n")
+                
+        if not inwhitespace:
+            temp.append("\n")
+        self.currentStr = temp
 
     def process_example_id(self, m):
-        self.exmeta["id"] = m.group(1)
-        #logging.debug("Storing ID: %s" % self.exmeta["id"] )
+        ident = m.group(1)
+        if ident not in self.idcache:
+            self.idcache.append(ident)
+        else:
+            raise Exception("Example %s in file %s has duplicate ident: '%s'" % (self.filepos,self.file,ident))
+        self.exmeta["id"] = ident
         return ''
 
-    def parse (self, file):
+    def parse (self, filen):
         import codecs
-        self.file = file
-        filepos = 0
+        self.file = filen
+        self.filepos = 0
         examples = []
         egid = re.compile("""#(\S+)\s+""")
-        #logging.info("[%s] Reading file %s" % (api.getInstanceId(short=True),file))
-        start = datetime.datetime.now()
         
-        if file.startswith("file://"):
-            file = file[7:]
+        if self.file.startswith("file://"):
+            self.file = self.file[7:]
         
-        if "://" in file:
-            content = urllib.urlopen(file).read().decode("utf8")
+        if "://" in self.file:
+            content = urllib.urlopen(self.file).read().decode("utf8")
         else:
-            fd = codecs.open(file, 'r', encoding="utf8")
+            fd = codecs.open(self.file, 'r', encoding="utf8")
             content = fd.read()
             fd.close()
         
         lines = re.split('\n|\r', content)
         first = True
+        boilerplate = False
         for line in lines:
             # Per-example sections begin with e.g.: 'TYPES: #music-2 Person, MusicComposition, Organization'
             line = line.rstrip()
 
             if line.startswith("TYPES:"):
-                filepos += 1
+                self.filepos += 1
                 self.nextPart('TYPES:')
-                #logging.debug("About to call api.Example.AddExample with terms: %s " % "".join( [" ; %s " % t.id for t in self.terms] ) )
                 #Create example from what has been previously collected
-                #If 1st call there will be no terms which will be regected and no xample created.
                 if first:
                     first = False
                 else:
-                    examples.append(Example(self.terms, self.preMarkupStr, self.microdataStr, self.rdfaStr, self.jsonStr, self.exmeta))
+                    if not boilerplate:
+                        examples.append(Example(self.terms, self.preMarkupStr, self.microdataStr, self.rdfaStr, self.jsonStr, self.exmeta))
+                    boilerplate = False
                     self.initFields()
-                self.exmeta['file'] = file
-                self.exmeta['filepos'] = filepos
+                self.exmeta['file'] = self.file
+                self.exmeta['filepos'] = self.filepos
                 typelist = re.split(':', line)
-                #logging.debug("TYPE INFO: '%s' " % line );
                 tdata = egid.sub(self.process_example_id, typelist[1]) # strips IDs, records them in exmeta["id"]
                 ttl = tdata.split(',')
                 for ttli in ttl:
                     ttli = re.sub(' ', '', ttli)
                     #logging.debug("TTLI: %s " % ttli); # danbri tmp
-                    if len(ttli) and "@@" not in ttli:
+                    if len(ttli) and "@@" not in ttli and not "FakeEntryNeeded" in ttli:
                         self.terms.append(ttli)
+                    else:
+                        boilerplate = True
             else:
                 tokens = ["PRE-MARKUP:", "MICRODATA:", "RDFA:", "JSON:"]
                 for tk in tokens:
@@ -226,12 +269,11 @@ class ExampleFileParser():
                     if line.startswith(tk):
                         self.nextPart(tk)
                         line = line[ltk:]
-                if (len(line) > 0):
-                    self.currentStr.append(line + "\n")
+                self.currentStr.append(line)
         self.nextPart('TYPES:') # should flush on each block of examples
-        filepos += 1
-        examples.append(Example(self.terms, self.preMarkupStr, self.microdataStr, self.rdfaStr, self.jsonStr, self.exmeta)) # should flush last one
-        #logging.info ("%s [%s] examples in %s" % (count,datetime.datetime.now() - start, file))
+        self.filepos += 1
+        if not boilerplate:
+            examples.append(Example(self.terms, self.preMarkupStr, self.microdataStr, self.rdfaStr, self.jsonStr, self.exmeta)) # should flush last one
         return examples
 
 
